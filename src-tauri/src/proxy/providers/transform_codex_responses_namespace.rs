@@ -46,39 +46,70 @@ pub(crate) struct NamespacedName {
 /// flatten; derives names exactly as [`flatten_request_namespaces`] does.
 pub(crate) fn namespace_restore_map(request_body: &Value) -> HashMap<String, NamespacedName> {
     let mut map = HashMap::new();
-    let Some(tools) = request_body.get("tools").and_then(Value::as_array) else {
-        return map;
-    };
-    for tool in tools {
-        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
-            continue;
-        }
-        let Some(namespace) = tool.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        let namespace = namespace.trim();
-        if namespace.is_empty() {
-            continue;
-        }
-        for child in namespace_children(tool) {
-            if child.get("type").and_then(Value::as_str) != Some("function") {
-                continue;
+    collect_namespace_restore_entries_from_tools(request_body.get("tools"), &mut map);
+    collect_namespace_restore_entries_from_tools(request_body.get("additional_tools"), &mut map);
+    if let Some(items) = request_body.get("input").and_then(Value::as_array) {
+        for item in items {
+            if matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("tool_search_output" | "additional_tools")
+            ) {
+                collect_namespace_restore_entries_from_tools(item.get("tools"), &mut map);
             }
-            let Some(name) = child.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            let name = name.trim();
-            if name.is_empty() {
-                continue;
-            }
-            let flat = flatten_namespace_tool_name(namespace, name);
-            map.entry(flat).or_insert_with(|| NamespacedName {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-            });
         }
     }
     map
+}
+
+fn collect_namespace_restore_entries_from_tools(
+    tools: Option<&Value>,
+    map: &mut HashMap<String, NamespacedName>,
+) {
+    for tool in tools.and_then(Value::as_array).into_iter().flatten() {
+        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            if let Some(object) = tool.as_object() {
+                add_namespace_restore_entries(object, map);
+            }
+        }
+    }
+}
+
+fn add_namespace_restore_entries(
+    namespace_tool: &serde_json::Map<String, Value>,
+    map: &mut HashMap<String, NamespacedName>,
+) {
+    let Some(namespace) = namespace_tool
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|namespace| !namespace.is_empty())
+    else {
+        return;
+    };
+    for child in namespace_tool
+        .get("tools")
+        .or_else(|| namespace_tool.get("children"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if child.get("type").and_then(Value::as_str) != Some("function") {
+            continue;
+        }
+        let Some(name) = child
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let flat = flatten_namespace_tool_name(namespace, name);
+        map.entry(flat).or_insert_with(|| NamespacedName {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+        });
+    }
 }
 
 /// Flatten Codex `namespace` tool declarations in a native Responses request
@@ -429,6 +460,59 @@ mod tests {
         assert_eq!(entry.name, "read");
         // Plain top-level tools are not in the restore map.
         assert!(!map.contains_key("plain_tool"));
+    }
+
+    #[test]
+    fn restore_map_collects_namespaces_from_tool_search_output() {
+        let body = json!({
+            "tools": [{ "type": "tool_search", "parameters": {} }],
+            "input": [{
+                "type": "tool_search_output",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "mcp__codex_app",
+                    "tools": [{
+                        "type": "function",
+                        "name": "read_thread",
+                        "parameters": {}
+                    }]
+                }]
+            }]
+        });
+        let map = namespace_restore_map(&body);
+        assert_eq!(
+            map.get("mcp__codex_app__read_thread"),
+            Some(&NamespacedName {
+                namespace: "mcp__codex_app".to_string(),
+                name: "read_thread".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn restore_map_ignores_namespace_shapes_nested_in_business_data() {
+        let body = json!({
+            "tools": [{
+                "type": "function",
+                "name": "mcp__real__do",
+                "parameters": { "type": "object" }
+            }],
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": {
+                    "type": "namespace",
+                    "name": "mcp__real",
+                    "tools": [{
+                        "type": "function",
+                        "name": "do",
+                        "parameters": { "type": "object" }
+                    }]
+                }
+            }]
+        });
+
+        assert!(namespace_restore_map(&body).is_empty());
     }
 
     #[test]

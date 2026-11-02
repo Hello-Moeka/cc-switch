@@ -1416,6 +1416,57 @@ fn codex_catalog_model_entry(
     entry
 }
 
+const CODEX_MUSE_SPARK_MODEL_PREFIX: &str = "muse-spark-";
+// Meta's Responses API is the standard OpenAI-compatible endpoint; OpenCode
+// uses the same model name but has additional strict gateway compatibility
+// handling in the proxy.
+const CODEX_MUSE_SPARK_DIRECT_MCP_HOSTS: &[&str] = &["api.meta.ai", "opencode.ai"];
+const CODEX_MUSE_SPARK_COMP_HASH: &str = "cc-switch-muse-direct-v1";
+
+pub(crate) fn is_codex_muse_spark_model(model: &str) -> bool {
+    model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with(CODEX_MUSE_SPARK_MODEL_PREFIX)
+}
+
+fn is_codex_muse_spark_direct_mcp_gateway(config_text: &str) -> bool {
+    extract_codex_base_url(config_text).is_some_and(|base_url| {
+        codex_url_host_matches_any(&base_url, CODEX_MUSE_SPARK_DIRECT_MCP_HOSTS)
+    })
+}
+
+/// Muse Spark supports function/MCP tools on native Responses, including parallel
+/// calls, but strict gateways reject Codex's freeform `apply_patch` declaration.
+/// Keep the conservative shell/tool surface and switch only the tested direct
+/// tool capabilities on. `supports_search_tool = true` keeps Codex App MCP tools
+/// available behind `tool_search`; the native Responses proxy removes the
+/// optional `limit` property that OpenCode's strict schema validator rejects.
+fn apply_codex_muse_spark_tool_profile(
+    entry_obj: &mut serde_json::Map<String, Value>,
+    spec: &CodexCatalogModelSpec,
+    profile: CodexCatalogToolProfile,
+    direct_mcp_gateway: bool,
+) {
+    if profile != CodexCatalogToolProfile::NativeResponses
+        || !is_codex_muse_spark_model(&spec.model)
+        || !direct_mcp_gateway
+    {
+        return;
+    }
+
+    entry_obj.insert("tool_mode".to_string(), json!("direct"));
+    entry_obj.insert("supports_search_tool".to_string(), json!(true));
+    entry_obj.insert(
+        "supports_parallel_tool_calls".to_string(),
+        json!(spec.supports_parallel_tool_calls.unwrap_or(true)),
+    );
+    entry_obj.insert("comp_hash".to_string(), json!(CODEX_MUSE_SPARK_COMP_HASH));
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CodexCatalogModelSpec {
     model: String,
@@ -2358,6 +2409,7 @@ fn codex_catalog_from_specs_for_row(
     profile: CodexCatalogToolProfile,
 ) -> Result<Value, AppError> {
     let windows = RowWindows::of(config_text);
+    let muse_spark_direct_mcp = is_codex_muse_spark_direct_mcp_gateway(config_text);
     // Vendors that publish an OFFICIAL Codex models.json for their native
     // `/responses` gateway get it mirrored verbatim instead of the neutral
     // template: its freeform apply_patch, vendor harness base_instructions and
@@ -2427,6 +2479,14 @@ fn codex_catalog_from_specs_for_row(
                     default_context_window,
                 ),
             };
+            if let Some(entry_obj) = entry.as_object_mut() {
+                apply_codex_muse_spark_tool_profile(
+                    entry_obj,
+                    spec,
+                    profile,
+                    muse_spark_direct_mcp,
+                );
+            }
             // A changed window needs a matching compaction threshold in single-provider
             // catalogs too. Otherwise an official/template threshold can stay at 244800
             // even after the user requests 1M. Keep untouched official defaults intact.
@@ -2566,8 +2626,9 @@ const CODEX_STACK_COMP_HASH: &str = "cc-switch";
 /// 老会话记下的值不变。
 fn join_stack_history(obj: &mut serde_json::Map<String, Value>) {
     let comp_hash = match obj.get("tool_mode").and_then(Value::as_str) {
+        Some("code_mode_only") => format!("{CODEX_STACK_COMP_HASH}-code_mode_only"),
+        Some("direct") | None => CODEX_STACK_COMP_HASH.to_string(),
         Some(mode) => format!("{CODEX_STACK_COMP_HASH}-{mode}"),
-        None => CODEX_STACK_COMP_HASH.to_string(),
     };
     obj.insert("comp_hash".to_string(), json!(comp_hash));
 }
@@ -5942,6 +6003,70 @@ wire_api = "responses"
         }
         assert!(models[2].get("tool_mode").is_none());
         assert_eq!(models[2]["comp_hash"], "cc-switch");
+    }
+
+    #[test]
+    fn muse_spark_native_catalog_uses_direct_mcp_tools_without_freeform_tools() {
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    { "model": "ccs-opencode-3/muse-spark-1.3-contributor" }
+                ]
+            }
+        });
+        let config = "model_provider = \"custom\"\n\
+                      model = \"muse-spark-1.3-contributor\"\n\
+                      [model_providers.custom]\n\
+                      base_url = \"https://opencode.ai/zen/go/v1\"\n\
+                      wire_api = \"responses\"\n";
+        let catalog = codex_model_catalog_from_settings(
+            &settings,
+            config,
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .unwrap()
+        .unwrap();
+        let entry = &catalog["models"][0];
+
+        assert_eq!(entry["tool_mode"], "direct");
+        assert_eq!(entry["supports_search_tool"], true);
+        assert_eq!(entry["supports_parallel_tool_calls"], true);
+        assert_eq!(entry["shell_type"], "shell_command");
+        assert_eq!(entry["comp_hash"], CODEX_MUSE_SPARK_COMP_HASH);
+        assert!(entry.get("apply_patch_tool_type").is_none());
+        assert!(entry.get("web_search_tool_type").is_none());
+
+        let meta_config = config.replace("https://opencode.ai/zen/go/v1", "https://api.meta.ai/v1");
+        let meta_catalog = codex_model_catalog_from_settings(
+            &settings,
+            &meta_config,
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .unwrap()
+        .unwrap();
+        let meta_entry = &meta_catalog["models"][0];
+        assert_eq!(meta_entry["tool_mode"], "direct");
+        assert_eq!(meta_entry["supports_search_tool"], true);
+        assert_eq!(meta_entry["comp_hash"], CODEX_MUSE_SPARK_COMP_HASH);
+
+        let relay_config =
+            config.replace("https://opencode.ai/zen/go/v1", "https://relay.example/v1");
+        let relay_catalog = codex_model_catalog_from_settings(
+            &settings,
+            &relay_config,
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .unwrap()
+        .unwrap();
+        let relay_entry = &relay_catalog["models"][0];
+        assert!(relay_entry.get("tool_mode").is_none());
+        assert_eq!(relay_entry["supports_parallel_tool_calls"], false);
+        assert!(relay_entry.get("comp_hash").is_none());
+
+        let mut direct = serde_json::Map::new();
+        direct.insert("tool_mode".to_string(), json!("direct"));
+        join_stack_history(&mut direct);
+        assert_eq!(direct["comp_hash"], CODEX_STACK_COMP_HASH);
     }
 
     #[test]

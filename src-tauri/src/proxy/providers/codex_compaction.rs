@@ -21,6 +21,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 pub(crate) const CCSWITCH_COMPACTION_PREFIX: &str = "ccswitch-compaction-v1:";
 
@@ -142,14 +143,29 @@ pub(crate) fn compaction_output_item(summary: &str) -> Value {
 pub(crate) fn summary_from_output_items<'a>(items: impl IntoIterator<Item = &'a Value>) -> String {
     let mut parts: Vec<&str> = Vec::new();
     for item in items {
-        if item.get("type").and_then(Value::as_str) != Some("message") {
+        if !matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("message" | "agent_message")
+        ) {
+            continue;
+        }
+        if let Some(text) = item
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            parts.push(text);
             continue;
         }
         let Some(content) = item.get("content").and_then(Value::as_array) else {
             continue;
         };
         for part in content {
-            if part.get("type").and_then(Value::as_str) != Some("output_text") {
+            if !matches!(
+                part.get("type").and_then(Value::as_str),
+                Some("output_text" | "text" | "input_text")
+            ) {
                 continue;
             }
             if let Some(text) = part
@@ -227,6 +243,8 @@ pub(crate) fn prepare_native_third_party_request(body: &mut Value) -> bool {
 /// 保持和 Codex 本地压缩请求一致的"只要文字"形态（codex-rs `compact.rs` 的 Prompt 不带 tools）。
 /// 工具定义保留：历史里回放的 `web_search_call`、`function_call` 等条目引用这些定义，
 /// 部分上游对"有调用历史、无工具定义"的请求直接拒绝（#7976）。
+/// OpenCode Muse 例外：它只接受 `tool_choice: "auto"`，因此 Muse 兼容层会把摘要
+/// 回合的 tools 全部移除。Muse 已实测接受保留调用历史、但不重新声明 tools 的请求。
 fn shape_summary_turn_request(body: &mut Value) {
     let Some(obj) = body.as_object_mut() else {
         return;
@@ -380,6 +398,8 @@ where
 struct NativeCompactionState {
     done_items: Vec<Value>,
     next_output_index: u64,
+    streamed_text: BTreeMap<u64, String>,
+    streamed_without_index: Vec<String>,
 }
 
 impl NativeCompactionState {
@@ -395,6 +415,33 @@ impl NativeCompactionState {
         };
 
         match event.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    if !delta.is_empty() {
+                        if let Some(index) = event.get("output_index").and_then(Value::as_u64) {
+                            self.streamed_text.entry(index).or_default().push_str(delta);
+                        } else {
+                            self.streamed_without_index.push(delta.to_string());
+                        }
+                    }
+                }
+                passthrough()
+            }
+            Some("response.output_text.done") => {
+                if let Some(text) = event
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    if let Some(index) = event.get("output_index").and_then(Value::as_u64) {
+                        self.streamed_text.insert(index, text.to_string());
+                    } else {
+                        self.streamed_without_index.clear();
+                        self.streamed_without_index.push(text.to_string());
+                    }
+                }
+                passthrough()
+            }
             Some("response.output_item.done") => {
                 if let Some(index) = event.get("output_index").and_then(Value::as_u64) {
                     self.next_output_index = self.next_output_index.max(index + 1);
@@ -424,6 +471,17 @@ impl NativeCompactionState {
             if let Some(output) = response.get("output").and_then(Value::as_array) {
                 summary = summary_from_output_items(output);
             }
+        }
+        if summary.is_empty() {
+            summary = self
+                .streamed_text
+                .values()
+                .chain(self.streamed_without_index.iter())
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
         }
         if summary.is_empty() {
             response["status"] = json!("failed");
@@ -754,6 +812,48 @@ mod tests {
                 .filter(|item| item["type"] == "compaction")
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn native_stream_uses_text_deltas_when_no_message_item_is_completed() {
+        let events = run_native(concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"streamed \"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"summary\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[]}}\n\n"
+        ))
+        .await;
+        let compaction = events
+            .iter()
+            .find(|event| event["item"]["type"] == "compaction")
+            .expect("streamed text must become a compaction item");
+        assert_eq!(
+            decode_compaction_summary(compaction["item"]["encrypted_content"].as_str().unwrap())
+                .as_deref(),
+            Some("streamed summary")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_stream_accepts_agent_message_summary_items() {
+        let events = run_native(concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"agent_message\",\"text\":\"agent summary\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[]}}\n\n"
+        ))
+        .await;
+        let compaction = events
+            .iter()
+            .find(|event| event["item"]["type"] == "compaction")
+            .expect("agent_message text must be accepted");
+        assert_eq!(
+            decode_compaction_summary(compaction["item"]["encrypted_content"].as_str().unwrap())
+                .as_deref(),
+            Some("agent summary")
         );
     }
 

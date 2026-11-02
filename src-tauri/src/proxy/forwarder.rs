@@ -2021,6 +2021,30 @@ impl RequestForwarder {
             );
         }
 
+        // OpenCode's Responses validator is stricter than Codex's native
+        // backend. Keep other providers byte-identical and only apply the
+        // evidence-backed compatibility rewrites to Muse requests.
+        if matches!(app_type, AppType::Codex)
+            && !codex_responses_to_chat
+            && !codex_responses_to_anthropic
+        {
+            let request_model = request_body
+                .get("model")
+                .and_then(|model| model.as_str())
+                .map(str::to_string);
+            if super::providers::provider_needs_opencode_muse_tool_search_compat(
+                provider,
+                request_model.as_deref(),
+            ) && super::providers::transform_codex_responses_tool_search::
+                apply_opencode_muse_request_compat(&mut request_body)?
+            {
+                log::debug!(
+                    "[Codex] Applied OpenCode Muse request compatibility rewrites (provider={})",
+                    provider.id
+                );
+            }
+        }
+
         // Stack 请求发往拒收托管 `web_search` 的原生 Responses 上游：去掉这个工具，和 Chat、
         // Anthropic 转换丢掉托管工具是同一件事。只对 Stack 请求、只对名单上的上游生效；
         // 路由请求和其他 Stack 请求逐字节不变。

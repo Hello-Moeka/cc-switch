@@ -226,6 +226,55 @@ pub fn provider_needs_responses_namespace_flatten(provider: &Provider) -> bool {
     provider.is_xai_oauth() || provider_is_xai_native_responses(provider)
 }
 
+/// OpenCode's native Responses validator requires every property in a tool
+/// schema to also be listed in `required`. Codex's client-side `tool_search`
+/// tool exposes an optional `limit` property, so Muse requests need that one
+/// property removed before the native Responses passthrough.
+pub fn provider_needs_opencode_muse_tool_search_compat(
+    provider: &Provider,
+    request_model: Option<&str>,
+) -> bool {
+    if !request_model.is_some_and(crate::codex_config::is_codex_muse_spark_model) {
+        return false;
+    }
+
+    let config_text = provider
+        .settings_config
+        .get("config")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let wire_api = extract_codex_wire_api_from_toml(config_text);
+    let api_format = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.api_format.as_deref())
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("apiFormat")
+                .and_then(|value| value.as_str())
+        });
+    let native_responses = wire_api
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("responses"))
+        || api_format.is_some_and(|value| value.eq_ignore_ascii_case("openai_responses"));
+    if !native_responses {
+        return false;
+    }
+
+    let base_url = extract_codex_base_url_from_toml(config_text).or_else(|| {
+        provider
+            .settings_config
+            .get("baseURL")
+            .or_else(|| provider.settings_config.get("baseUrl"))
+            .or_else(|| provider.settings_config.get("base_url"))
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string)
+    });
+    base_url
+        .is_some_and(|url| crate::codex_config::codex_url_host_matches_any(&url, &["opencode.ai"]))
+}
+
 /// True when this Codex provider talks native Responses to first-party xAI
 /// (`api.x.ai`), including API-key Grok cards that are not `xai_oauth`.
 fn provider_is_xai_native_responses(provider: &Provider) -> bool {
@@ -1750,6 +1799,38 @@ wire_api = "anthropic"
         assert!(!should_convert_codex_responses_to_anthropic(
             &provider,
             "/chat/completions"
+        ));
+    }
+
+    #[test]
+    fn opencode_muse_tool_search_compat_requires_native_responses_and_model() {
+        let provider = |base_url: &str, wire_api: &str| {
+            create_provider(json!({
+                "config": format!(
+                    "model_provider = \"custom\"\nmodel = \"muse-spark-1.3-contributor\"\n\n[model_providers.custom]\nbase_url = \"{base_url}\"\nwire_api = \"{wire_api}\"\n"
+                )
+            }))
+        };
+        let native = provider("https://opencode.ai/zen/go/v1", "responses");
+        assert!(provider_needs_opencode_muse_tool_search_compat(
+            &native,
+            Some("ccs-opencode-3/muse-spark-1.3-contributor")
+        ));
+        assert!(!provider_needs_opencode_muse_tool_search_compat(
+            &native,
+            Some("ccs-opencode/deepseek-v4.1-flash")
+        ));
+
+        let chat = provider("https://opencode.ai/zen/go/v1", "chat");
+        assert!(!provider_needs_opencode_muse_tool_search_compat(
+            &chat,
+            Some("muse-spark-1.3-contributor")
+        ));
+
+        let meta = provider("https://api.meta.ai/v1", "responses");
+        assert!(!provider_needs_opencode_muse_tool_search_compat(
+            &meta,
+            Some("muse-spark-1.3-contributor")
         ));
     }
 

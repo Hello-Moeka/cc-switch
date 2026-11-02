@@ -1186,14 +1186,19 @@ async fn handle_responses_for_app(
             .await;
     }
 
-    // Native Responses passthrough to a strict gateway (xAI): restore flattened
-    // function-call names *and* rewrite whole-float tool arguments. The integer
-    // rewrite must run even when the request had no namespace tools.
-    if super::providers::provider_needs_responses_namespace_flatten(&ctx.provider) {
-        return handle_codex_xai_native_responses_rewrite(
+    // Native Responses passthrough with flattened namespace tools (xAI and
+    // OpenCode Muse): restore function-call names and normalize tool arguments.
+    if super::providers::provider_needs_responses_namespace_flatten(&ctx.provider)
+        || super::providers::provider_needs_opencode_muse_tool_search_compat(
+            &ctx.provider,
+            Some(ctx.request_model.as_str()),
+        )
+    {
+        return handle_codex_flattened_native_responses_rewrite(
             response,
             &ctx,
             &state,
+            is_stream,
             connection_guard,
             namespace_restore_map,
         )
@@ -1247,7 +1252,7 @@ async fn handle_codex_native_compaction_response(
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
     // 错误体和非流式响应照常透传：Codex 的压缩请求总是流式，错误交给它按原样重试。
-    if !status.is_success() || !response.is_sse() {
+    if !status.is_success() || !is_native_responses_sse_response(&response, true) {
         return process_response(
             response,
             ctx,
@@ -1279,6 +1284,13 @@ async fn handle_codex_native_compaction_response(
             log::error!("[{}] 构建压缩回合流式响应失败: {e}", ctx.tag);
             ProxyError::Internal(format!("Failed to build streaming response: {e}"))
         })
+}
+
+fn is_native_responses_sse_response(
+    response: &super::hyper_client::ProxyResponse,
+    request_stream: bool,
+) -> bool {
+    response.is_sse() || (request_stream && !response.is_json())
 }
 
 /// 处理 /v1/responses/compact 请求（OpenAI Responses Compact API - Codex CLI 透传）
@@ -1504,11 +1516,17 @@ async fn handle_responses_compact_for_app(
         .await;
     }
 
-    if super::providers::provider_needs_responses_namespace_flatten(&ctx.provider) {
-        return handle_codex_xai_native_responses_rewrite(
+    if super::providers::provider_needs_responses_namespace_flatten(&ctx.provider)
+        || super::providers::provider_needs_opencode_muse_tool_search_compat(
+            &ctx.provider,
+            Some(ctx.request_model.as_str()),
+        )
+    {
+        return handle_codex_flattened_native_responses_rewrite(
             response,
             &ctx,
             &state,
+            is_stream,
             connection_guard,
             namespace_restore_map,
         )
@@ -1547,7 +1565,7 @@ async fn handle_codex_late_arguments_repair(
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
-    if !status.is_success() || !response.is_sse() {
+    if !status.is_success() || !is_native_responses_sse_response(&response, is_stream) {
         return process_response(
             response,
             ctx,
@@ -1580,14 +1598,15 @@ async fn handle_codex_late_arguments_repair(
         })
 }
 
-/// Response handler for the native Responses passthrough to xAI: restore
-/// flattened `function_call` names and rewrite whole-float tool arguments.
+/// Response handler for native Responses passthrough after namespace flattening:
+/// restore `function_call` names and rewrite whole-float tool arguments.
 /// Error bodies pass through unchanged. Usage is collected exactly as
 /// `process_response` would (same `CODEX_PARSER_CONFIG`).
-async fn handle_codex_xai_native_responses_rewrite(
+async fn handle_codex_flattened_native_responses_rewrite(
     response: super::hyper_client::ProxyResponse,
     ctx: &RequestContext,
     state: &ProxyState,
+    is_stream: bool,
     connection_guard: Option<ActiveConnectionGuard>,
     restore_map: std::collections::HashMap<
         String,
@@ -1611,14 +1630,19 @@ async fn handle_codex_xai_native_responses_rewrite(
         .await;
     }
 
-    if response.is_sse() {
+    if is_native_responses_sse_response(&response, is_stream) {
         let builder = rewritten_sse_response_builder(status, response.headers());
 
-        let restore_stream =
-            transform_codex_responses_xai_sanitize::create_xai_native_responses_sse_stream(
-                response.bytes_stream(),
-                restore_map,
+        let repair_late_arguments =
+            super::providers::provider_needs_opencode_muse_tool_search_compat(
+                &ctx.provider,
+                Some(ctx.request_model.as_str()),
             );
+        let restore_stream = create_flattened_native_responses_sse_stream(
+            response.bytes_stream(),
+            restore_map,
+            repair_late_arguments,
+        );
         let usage_collector =
             create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
         let logged_stream = create_logged_passthrough_stream(
@@ -1729,6 +1753,34 @@ async fn handle_codex_xai_native_responses_rewrite(
             log::error!("[{}] 构建 namespace 还原响应失败: {e}", ctx.tag);
             ProxyError::Internal(format!("Failed to build response: {e}"))
         })
+}
+
+fn create_flattened_native_responses_sse_stream<E>(
+    stream: impl futures::Stream<Item = Result<Bytes, E>> + Send + 'static,
+    restore_map: std::collections::HashMap<
+        String,
+        transform_codex_responses_namespace::NamespacedName,
+    >,
+    repair_late_arguments: bool,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send
+where
+    E: std::error::Error + Send + 'static,
+{
+    let restored = transform_codex_responses_xai_sanitize::create_xai_native_responses_sse_stream(
+        stream,
+        restore_map,
+    );
+    if repair_late_arguments {
+        Box::pin(
+            super::providers::responses_late_arguments::create_late_arguments_repair_stream(
+                restored,
+            ),
+        )
+            as std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>
+    } else {
+        Box::pin(restored)
+            as std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>
+    }
 }
 
 async fn handle_codex_chat_to_responses_transform(
@@ -4814,5 +4866,138 @@ mod stack_tests {
         .await
         .expect("models");
         assert_eq!(body, json!({ "data": [], "has_more": false }));
+    }
+
+    #[tokio::test]
+    async fn flattened_stream_repairs_late_arguments_after_namespace_restore() {
+        let function_item = |arguments: &str| {
+            json!({
+                "type": "function_call",
+                "id": "fc_late",
+                "call_id": "call_late",
+                "name": "mcp__probe__echo",
+                "arguments": arguments
+            })
+        };
+        let events = vec![
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": function_item("")
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "item_id": "fc_late",
+                "name": "mcp__probe__echo",
+                "arguments": ""
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": function_item("")
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "item_id": "fc_late",
+                "delta": "{\"value\":\"late-ok\"}"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "output": [function_item("{\"value\":\"late-ok\"}")]
+                }
+            }),
+        ];
+        let input = events
+            .into_iter()
+            .map(|event| {
+                Ok::<Bytes, std::io::Error>(Bytes::from(format!(
+                    "event: {}\ndata: {}\n\n",
+                    event["type"].as_str().unwrap(),
+                    event
+                )))
+            })
+            .collect::<Vec<_>>();
+        let mut restore_map = std::collections::HashMap::new();
+        restore_map.insert(
+            "mcp__probe__echo".to_string(),
+            transform_codex_responses_namespace::NamespacedName {
+                namespace: "mcp__probe".to_string(),
+                name: "echo".to_string(),
+            },
+        );
+
+        let output = create_flattened_native_responses_sse_stream(
+            futures::stream::iter(input),
+            restore_map,
+            true,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let parsed = output
+            .into_iter()
+            .map(|chunk| {
+                let text = String::from_utf8(chunk.unwrap().to_vec()).unwrap();
+                let data = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap();
+                serde_json::from_str::<Value>(data).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let types = parsed
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            types,
+            vec![
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        assert_eq!(parsed[2]["arguments"], "{\"value\":\"late-ok\"}");
+        assert_eq!(parsed[3]["item"]["namespace"], "mcp__probe");
+        assert_eq!(parsed[3]["item"]["name"], "echo");
+        assert_eq!(parsed[3]["item"]["arguments"], "{\"value\":\"late-ok\"}");
+    }
+
+    #[test]
+    fn native_responses_sse_detection_uses_request_stream_when_header_is_missing() {
+        let response = |content_type: Option<&str>| {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(content_type) = content_type {
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    content_type.parse().unwrap(),
+                );
+            }
+            super::super::hyper_client::ProxyResponse::buffered(
+                StatusCode::OK,
+                headers,
+                Bytes::new(),
+            )
+        };
+
+        assert!(!is_native_responses_sse_response(&response(None), false));
+        assert!(is_native_responses_sse_response(&response(None), true));
+        assert!(is_native_responses_sse_response(
+            &response(Some("text/plain")),
+            true
+        ));
+        assert!(!is_native_responses_sse_response(
+            &response(Some("application/json")),
+            true
+        ));
+        assert!(is_native_responses_sse_response(
+            &response(Some("text/event-stream")),
+            false
+        ));
     }
 }

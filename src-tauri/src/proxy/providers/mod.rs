@@ -41,6 +41,7 @@ pub mod transform_codex_anthropic;
 pub mod transform_codex_chat;
 pub mod transform_codex_chat_moonshot_schema;
 pub mod transform_codex_responses_namespace;
+pub(crate) mod transform_codex_responses_tool_search;
 pub mod transform_codex_responses_xai_sanitize;
 pub mod transform_gemini;
 pub mod transform_responses;
@@ -66,6 +67,7 @@ pub use codex::{
     apply_codex_chat_upstream_model, apply_codex_upstream_model, codex_provider_upstream_model,
     codex_stack_upstream_rejects_web_search, inject_codex_chat_prompt_cache_key,
     is_codex_official_provider, is_codex_responses_endpoint,
+    provider_needs_opencode_muse_tool_search_compat,
     provider_needs_responses_late_arguments_repair, provider_needs_responses_namespace_flatten,
     resolve_codex_catalog_tool_profile, resolve_codex_chat_reasoning_config,
     should_convert_codex_responses_to_anthropic, should_convert_codex_responses_to_chat,
