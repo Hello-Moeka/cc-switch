@@ -24,6 +24,7 @@ pub mod codex_oauth_auth;
 pub(crate) mod codex_responses_sse;
 pub mod copilot_auth;
 pub mod copilot_model_map;
+pub(crate) mod copilot_responses;
 mod gemini;
 pub(crate) mod gemini_schema;
 pub mod gemini_shadow;
@@ -40,6 +41,7 @@ pub mod transform;
 pub mod transform_codex_anthropic;
 pub mod transform_codex_chat;
 pub mod transform_codex_chat_moonshot_schema;
+pub mod transform_codex_responses_kimi_history;
 pub mod transform_codex_responses_namespace;
 pub(crate) mod transform_codex_responses_tool_search;
 pub mod transform_codex_responses_xai_sanitize;
@@ -223,7 +225,8 @@ impl ProviderType {
             | AppType::Kimi
             | AppType::Dsh
             | AppType::Omp
-            | AppType::Agy => return None,
+            | AppType::Agy
+            | AppType::Copilot => return None,
         };
         Some(provider_type)
     }
@@ -284,7 +287,8 @@ pub fn get_adapter(app_type: &AppType) -> Option<Box<dyn ProviderAdapter>> {
         | AppType::Kimi
         | AppType::Dsh
         | AppType::Omp
-        | AppType::Agy => return None,
+        | AppType::Agy
+        | AppType::Copilot => return None,
     })
 }
 
