@@ -697,10 +697,8 @@ pub(crate) fn apply_xai_native_responses_request_compat(
             "[Codex] Rewrote xAI-unsupported agent_message input items (provider={provider_id})"
         );
     }
-    if rewrite_xai_call_id_less_tool_outputs(body) {
-        log::info!(
-            "[Codex] Rewrote function_call_output items without call_id for xAI (provider={provider_id})"
-        );
+    if rewrite_call_id_less_tool_outputs(body) {
+        log::info!("[Codex] Rewrote call-id-less tool outputs for xAI (provider={provider_id})");
     }
 }
 
@@ -711,24 +709,27 @@ const ORPHAN_TOOL_OUTPUT_MARKER: &str = "[tool_result without a matching tool_ca
 /// Content part types a Responses `message` accepts as-is from a tool output.
 const MESSAGE_CONTENT_PART_TYPES: &[&str] = &["input_text", "input_image", "input_file"];
 
-/// Rewrite top-level `function_call_output` items that carry no `call_id` into
-/// user `message` items. Codex Desktop injects these receipts on its own
-/// (create_thread delegation, automation_update, heartbeat, cross-thread
-/// messages) with only an `fco_` id; xAI's strict deserializer 422s the whole
-/// request (`input[N]: invalid "function_call_output" item: missing field
-/// call_id`), and since the receipt stays in history the thread never recovers.
+/// Rewrite top-level tool outputs that carry no `call_id` into user `message`
+/// items. Codex Desktop injects these receipts on its own (page context,
+/// create_thread delegation, automation_update, heartbeat, cross-thread
+/// messages) with only an `fco_` id. Strict Responses deserializers reject the
+/// whole request (`input[N]: invalid tool output item: missing field call_id`),
+/// and since the receipt stays in history the thread never recovers.
 ///
 /// Rewrite rather than drop: the receipt carries the delegated task text.
 /// Items with a `call_id` are left alone even if their call is not in `input`,
 /// because a `previous_response_id` continuation legitimately pairs them with
 /// a call from the stored response.
-pub(crate) fn rewrite_xai_call_id_less_tool_outputs(body: &mut Value) -> bool {
+pub(crate) fn rewrite_call_id_less_tool_outputs(body: &mut Value) -> bool {
     let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return false;
     };
     let mut changed = false;
     for item in input {
-        if json_type(item) != Some("function_call_output") {
+        if !matches!(
+            json_type(item),
+            Some("function_call_output" | "custom_tool_call_output")
+        ) {
             continue;
         }
         let has_call_id = item
@@ -1844,7 +1845,7 @@ mod tests {
                 {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
             ]
         });
-        assert!(rewrite_xai_call_id_less_tool_outputs(&mut body));
+        assert!(rewrite_call_id_less_tool_outputs(&mut body));
         assert_eq!(
             body["input"][2],
             json!({
@@ -1861,7 +1862,7 @@ mod tests {
             body["input"][3],
             json!({"type": "function_call_output", "call_id": "call_1", "output": "ok"})
         );
-        assert!(!rewrite_xai_call_id_less_tool_outputs(&mut body));
+        assert!(!rewrite_call_id_less_tool_outputs(&mut body));
     }
 
     #[test]
@@ -1870,15 +1871,17 @@ mod tests {
             "input": [
                 {"type": "function_call_output", "id": "fco_1", "output": "automation"},
                 {"type": "function_call_output", "call_id": "  ", "output": "heartbeat"},
+                {"type": "custom_tool_call_output", "id": "ctco_1", "output": "manual"},
                 // Paired through previous_response_id, not through `input`.
                 {"type": "function_call_output", "call_id": "call_prev", "output": "kept"}
             ]
         });
-        assert!(rewrite_xai_call_id_less_tool_outputs(&mut body));
+        assert!(rewrite_call_id_less_tool_outputs(&mut body));
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][1]["type"], "message");
-        assert_eq!(body["input"][2]["type"], "function_call_output");
-        assert_eq!(body["input"][2]["call_id"], "call_prev");
+        assert_eq!(body["input"][2]["type"], "message");
+        assert_eq!(body["input"][3]["type"], "function_call_output");
+        assert_eq!(body["input"][3]["call_id"], "call_prev");
     }
 
     #[test]
@@ -1893,7 +1896,7 @@ mod tests {
                 ]
             }]
         });
-        assert!(rewrite_xai_call_id_less_tool_outputs(&mut body));
+        assert!(rewrite_call_id_less_tool_outputs(&mut body));
         let content = body["input"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 4);
         assert_eq!(
@@ -1919,7 +1922,7 @@ mod tests {
             ]
         });
         let before = body.clone();
-        assert!(!rewrite_xai_call_id_less_tool_outputs(&mut body));
+        assert!(!rewrite_call_id_less_tool_outputs(&mut body));
         assert_eq!(body, before);
     }
 

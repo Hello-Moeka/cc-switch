@@ -20,6 +20,9 @@ const MUSE_UNSUPPORTED_INCLUDE_MARKERS: &[&str] =
 /// by provider host, native `wire_api`, and the final outbound model.
 pub(crate) fn apply_opencode_muse_request_compat(body: &mut Value) -> Result<bool, ProxyError> {
     let mut changed = false;
+    // Codex page-context receipts use an `fco_` id but omit `call_id`.
+    changed |=
+        super::transform_codex_responses_xai_sanitize::rewrite_call_id_less_tool_outputs(body);
     if let Some(root) = body.as_object_mut() {
         for field in MUSE_UNSUPPORTED_TOP_LEVEL_FIELDS {
             changed |= root.remove(*field).is_some();
@@ -610,6 +613,52 @@ mod tests {
             "mcp__codex_app.read_thread"
         );
         assert_eq!(body["input"][0]["output"]["arguments"], "");
+    }
+
+    #[test]
+    fn rewrites_call_id_less_page_receipts_from_long_muse_history() {
+        let mut body = json!({
+            "model": "ccs-opencode-4/muse-spark-1.3-contributor",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_keep",
+                    "name": "shell",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "fco_01a1c5d2-6d67-72b1-b8ca-563a40f0cbbd",
+                    "name": "codex_apps_open_page",
+                    "namespace": "agent",
+                    "output": "## Referenced chats with Codex:"
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "fco_01a1c5d2-6d72-7f73-84ef-f9e2016af7b5",
+                    "name": "codex_apps_selected_page_part_1_of_1",
+                    "namespace": "agent",
+                    "output": "{\"page_id\":null}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_keep",
+                    "output": "ok"
+                }
+            ]
+        });
+
+        assert!(apply_opencode_muse_request_compat(&mut body).unwrap());
+        assert_eq!(body["input"][0]["type"], "function_call");
+        assert_eq!(body["input"][1]["type"], "message");
+        assert_eq!(body["input"][2]["type"], "message");
+        assert_eq!(body["input"][3]["type"], "function_call_output");
+        assert_eq!(body["input"][3]["call_id"], "call_keep");
+        assert!(body["input"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("[tool_result without a matching tool_call]"));
+        assert!(!apply_opencode_muse_request_compat(&mut body).unwrap());
     }
 
     #[test]

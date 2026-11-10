@@ -1215,10 +1215,8 @@ async fn handle_responses_for_app(
     if super::providers::provider_needs_responses_namespace_flatten(
         &ctx.provider,
         ctx.outbound_model.as_deref(),
-    ) || super::providers::provider_needs_opencode_muse_tool_search_compat(
-        &ctx.provider,
-        Some(ctx.request_model.as_str()),
-    ) {
+    ) || codex_uses_opencode_muse_compat(&ctx)
+    {
         return handle_codex_flattened_native_responses_rewrite(
             response,
             &ctx,
@@ -1569,10 +1567,8 @@ async fn handle_responses_compact_for_app(
     if super::providers::provider_needs_responses_namespace_flatten(
         &ctx.provider,
         ctx.outbound_model.as_deref(),
-    ) || super::providers::provider_needs_opencode_muse_tool_search_compat(
-        &ctx.provider,
-        Some(ctx.request_model.as_str()),
-    ) {
+    ) || codex_uses_opencode_muse_compat(&ctx)
+    {
         return handle_codex_flattened_native_responses_rewrite(
             response,
             &ctx,
@@ -1688,11 +1684,7 @@ async fn handle_codex_flattened_native_responses_rewrite(
         // Copilot repairs late arguments before restoring Grok names. Muse
         // repairs them after namespace restoration, where its compatibility
         // path exposes the final function-call shape.
-        let repair_after_restore =
-            super::providers::provider_needs_opencode_muse_tool_search_compat(
-                &ctx.provider,
-                Some(ctx.request_model.as_str()),
-            );
+        let repair_after_restore = codex_uses_opencode_muse_compat(ctx);
         let repair_before_restore = matches!(ctx.app_type, AppType::Codex)
             && ctx.provider.is_github_copilot()
             && !repair_after_restore;
@@ -1812,6 +1804,14 @@ async fn handle_codex_flattened_native_responses_rewrite(
             log::error!("[{}] 构建 namespace 还原响应失败: {e}", ctx.tag);
             ProxyError::Internal(format!("Failed to build response: {e}"))
         })
+}
+
+fn codex_uses_opencode_muse_compat(ctx: &RequestContext) -> bool {
+    let model = ctx
+        .outbound_model
+        .as_deref()
+        .or(Some(ctx.request_model.as_str()));
+    super::providers::provider_needs_opencode_muse_tool_search_compat(&ctx.provider, model)
 }
 
 fn create_flattened_native_responses_sse_stream<E>(

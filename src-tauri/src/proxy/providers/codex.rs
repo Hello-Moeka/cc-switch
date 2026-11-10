@@ -244,12 +244,13 @@ pub fn provider_needs_responses_namespace_flatten(
 /// OpenCode's native Responses validator requires every property in a tool
 /// schema to also be listed in `required`. Codex's client-side `tool_search`
 /// tool exposes an optional `limit` property, so Muse requests need that one
-/// property removed before the native Responses passthrough.
+/// property removed before the native Responses passthrough. Pass the resolved
+/// outbound model so aggregate aliases still select the Muse compatibility path.
 pub fn provider_needs_opencode_muse_tool_search_compat(
     provider: &Provider,
-    request_model: Option<&str>,
+    model: Option<&str>,
 ) -> bool {
-    if !request_model.is_some_and(crate::codex_config::is_codex_muse_spark_model) {
+    if !model.is_some_and(crate::codex_config::is_codex_muse_spark_model) {
         return false;
     }
 
