@@ -1342,7 +1342,19 @@ fn is_native_responses_sse_response(
     response: &super::hyper_client::ProxyResponse,
     request_stream: bool,
 ) -> bool {
-    response.is_sse() || (request_stream && !response.is_json())
+    if response.is_sse() {
+        return true;
+    }
+    if !request_stream || response.is_json() {
+        return false;
+    }
+    let Some(content_type) = response.content_type() else {
+        return true;
+    };
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/plain"))
 }
 
 /// 处理 /v1/responses/compact 请求（OpenAI Responses Compact API - Codex CLI 透传）
@@ -5797,7 +5809,7 @@ mod stack_tests {
     }
 
     #[test]
-    fn native_responses_sse_detection_uses_request_stream_when_header_is_missing() {
+    fn native_responses_sse_detection_narrows_implicit_content_types() {
         let response = |content_type: Option<&str>| {
             let mut headers = axum::http::HeaderMap::new();
             if let Some(content_type) = content_type {
@@ -5821,6 +5833,14 @@ mod stack_tests {
         ));
         assert!(!is_native_responses_sse_response(
             &response(Some("application/json")),
+            true
+        ));
+        assert!(!is_native_responses_sse_response(
+            &response(Some("text/html")),
+            true
+        ));
+        assert!(!is_native_responses_sse_response(
+            &response(Some("application/octet-stream")),
             true
         ));
         assert!(is_native_responses_sse_response(

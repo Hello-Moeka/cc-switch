@@ -260,8 +260,7 @@ pub(crate) fn compaction_retry_without_tool_choice(request: &Value) -> Option<Va
 /// 保持和 Codex 本地压缩请求一致的"只要文字"形态（codex-rs `compact.rs` 的 Prompt 不带 tools）。
 /// 工具定义保留：历史里回放的 `web_search_call`、`function_call` 等条目引用这些定义，
 /// 部分上游对"有调用历史、无工具定义"的请求直接拒绝（#7976）。
-/// OpenCode Muse 例外：它只接受 `tool_choice: "auto"`，因此 Muse 兼容层会把摘要
-/// 回合的 tools 全部移除。Muse 已实测接受保留调用历史、但不重新声明 tools 的请求。
+/// 拒绝 `tool_choice: "none"` 的上游由 forwarder 的第三方原生 Responses 400 重试处理。
 fn shape_summary_turn_request(body: &mut Value) {
     let Some(obj) = body.as_object_mut() else {
         return;

@@ -20,9 +20,7 @@ const MUSE_UNSUPPORTED_INCLUDE_MARKERS: &[&str] =
 /// by provider host, native `wire_api`, and the final outbound model.
 pub(crate) fn apply_opencode_muse_request_compat(body: &mut Value) -> Result<bool, ProxyError> {
     let mut changed = false;
-    // Codex page-context receipts use an `fco_` id but omit `call_id`.
-    changed |=
-        super::transform_codex_responses_xai_sanitize::rewrite_call_id_less_tool_outputs(body);
+    // Call-id-less receipts are normalized by the shared native Responses pipeline.
     if let Some(root) = body.as_object_mut() {
         for field in MUSE_UNSUPPORTED_TOP_LEVEL_FIELDS {
             changed |= root.remove(*field).is_some();
@@ -35,10 +33,7 @@ pub(crate) fn apply_opencode_muse_request_compat(body: &mut Value) -> Result<boo
         changed |= normalize_opencode_muse_tool_calls(body, &restore_map);
         changed |= normalize_tool_search_output_carriers(body);
         changed |= remove_additional_tool_input_carriers(body);
-        if let Some(root) = body.as_object_mut() {
-            changed |= root.remove("tools").is_some();
-        }
-        changed |= normalize_tool_choice_for_muse(body);
+        changed |= normalize_tool_schemas_for_muse(body);
         return Ok(changed);
     }
 
@@ -49,8 +44,7 @@ pub(crate) fn apply_opencode_muse_request_compat(body: &mut Value) -> Result<boo
     changed |= normalize_opencode_muse_tool_calls(body, &restore_map);
     changed |= normalize_tool_search_output_carriers(body);
     changed |= remove_additional_tool_input_carriers(body);
-    changed |= normalize_function_tool_schemas(body);
-    changed |= normalize_tool_search_schemas(body);
+    changed |= normalize_tool_schemas_for_muse(body);
     changed |= normalize_web_search_tools(body);
 
     if has_structured_output(body) {
@@ -364,6 +358,12 @@ fn normalize_parameters_object(parameters: &mut Value) -> bool {
     changed
 }
 
+fn normalize_tool_schemas_for_muse(body: &mut Value) -> bool {
+    let mut changed = normalize_function_tool_schemas(body);
+    changed |= normalize_tool_search_schemas(body);
+    changed
+}
+
 fn normalize_function_tool_schemas(body: &mut Value) -> bool {
     let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
         return false;
@@ -616,52 +616,6 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_call_id_less_page_receipts_from_long_muse_history() {
-        let mut body = json!({
-            "model": "ccs-opencode-4/muse-spark-1.3-contributor",
-            "input": [
-                {
-                    "type": "function_call",
-                    "call_id": "call_keep",
-                    "name": "shell",
-                    "arguments": "{}"
-                },
-                {
-                    "type": "function_call_output",
-                    "id": "fco_01a1c5d2-6d67-72b1-b8ca-563a40f0cbbd",
-                    "name": "codex_apps_open_page",
-                    "namespace": "agent",
-                    "output": "## Referenced chats with Codex:"
-                },
-                {
-                    "type": "function_call_output",
-                    "id": "fco_01a1c5d2-6d72-7f73-84ef-f9e2016af7b5",
-                    "name": "codex_apps_selected_page_part_1_of_1",
-                    "namespace": "agent",
-                    "output": "{\"page_id\":null}"
-                },
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_keep",
-                    "output": "ok"
-                }
-            ]
-        });
-
-        assert!(apply_opencode_muse_request_compat(&mut body).unwrap());
-        assert_eq!(body["input"][0]["type"], "function_call");
-        assert_eq!(body["input"][1]["type"], "message");
-        assert_eq!(body["input"][2]["type"], "message");
-        assert_eq!(body["input"][3]["type"], "function_call_output");
-        assert_eq!(body["input"][3]["call_id"], "call_keep");
-        assert!(body["input"][1]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("[tool_result without a matching tool_call]"));
-        assert!(!apply_opencode_muse_request_compat(&mut body).unwrap());
-    }
-
-    #[test]
     fn full_muse_tool_search_round_trip_flattens_and_restores_namespace() {
         let mut request = json!({
             "model": "muse-spark-1.3-contributor",
@@ -883,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_summary_turn_never_sends_the_unsupported_none_choice() {
+    fn compaction_summary_turn_leaves_choice_for_upstream_retry() {
         let mut body = json!({
             "model": "muse-spark-1.3-contributor",
             "tools": [{
@@ -914,15 +868,55 @@ mod tests {
 
         assert!(super::super::codex_compaction::prepare_native_third_party_request(&mut body));
         assert_eq!(body["tool_choice"], "none");
-        assert!(apply_opencode_muse_request_compat(&mut body).unwrap());
-        assert!(body.get("tools").is_none());
-        assert!(body.get("tool_choice").is_none());
-        assert!(body.get("parallel_tool_calls").is_none());
+        assert!(!apply_opencode_muse_request_compat(&mut body).unwrap());
+        assert!(body.get("tools").is_some());
+        assert_eq!(body["tool_choice"], "none");
         assert!(body["input"]
             .as_array()
             .unwrap()
             .iter()
             .any(|item| { item.get("type").and_then(Value::as_str) == Some("function_call") }));
+    }
+
+    #[test]
+    fn compaction_summary_turn_normalizes_tool_search_schema() {
+        let mut body = json!({
+            "model": "muse-spark-1.3-contributor",
+            "tools": [{
+                "type": "tool_search",
+                "execution": "client",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "limit": { "type": "number" }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
+            }],
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "hi" }]
+            }, {
+                "type": "compaction_trigger"
+            }]
+        });
+
+        assert!(super::super::codex_compaction::prepare_native_third_party_request(&mut body));
+        assert_eq!(body["tool_choice"], "none");
+        assert!(apply_opencode_muse_request_compat(&mut body).unwrap());
+        assert_eq!(body["tool_choice"], "none");
+        assert!(body["tools"].is_array());
+        assert!(body["tools"][0]["parameters"]["properties"]
+            .get("limit")
+            .is_none());
+        assert_eq!(
+            body["tools"][0]["parameters"]["properties"]["query"]["type"],
+            "string"
+        );
+        assert_eq!(body["tools"][0]["parameters"]["required"], json!(["query"]));
     }
 
     #[test]
