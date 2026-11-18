@@ -274,7 +274,7 @@ pub fn provider_needs_opencode_muse_tool_search_compat(
         return false;
     }
 
-    let base_url = extract_codex_base_url_from_toml(config_text).or_else(|| {
+    let base_url = extract_codex_base_url(config_text).or_else(|| {
         provider
             .settings_config
             .get("baseURL")
