@@ -9,6 +9,20 @@ pub(super) fn apply_native_responses_request_compat(
     body: &mut Value,
     keep_resolved_model: bool,
 ) -> Result<(), ProxyError> {
+    let outbound_model = body.get("model").and_then(Value::as_str);
+    if crate::proxy::providers::provider_needs_opencode_muse_native_compat(provider, outbound_model)
+    {
+        if crate::proxy::providers::transform_codex_responses_opencode_muse::
+            apply_opencode_muse_request_compat(body)
+        {
+            log::debug!(
+                "[Codex] Applied OpenCode Muse request compatibility rewrites (provider={})",
+                provider.id
+            );
+        }
+        return Ok(());
+    }
+
     if !crate::proxy::providers::is_codex_official_provider(provider)
         && crate::proxy::providers::transform_codex_responses_xai_sanitize::rewrite_xai_call_id_less_tool_outputs(body)
     {
