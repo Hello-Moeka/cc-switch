@@ -487,17 +487,11 @@ fn normalize_tool_search_schemas(body: &mut Value) -> bool {
         let property_names = parameters
             .get("properties")
             .and_then(Value::as_object)
-            .map(|properties| properties.keys().cloned().collect::<HashSet<_>>())
+            .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
-        if let Some(required) = parameters.get_mut("required").and_then(Value::as_array_mut) {
-            let before = required.len();
-            required.retain(|name| {
-                name.as_str()
-                    .is_some_and(|name| property_names.contains(name))
-            });
-            changed |= required.len() != before;
-        } else {
-            parameters.insert("required".to_string(), json!([]));
+        let required = json!(property_names);
+        if parameters.get("required") != Some(&required) {
+            parameters.insert("required".to_string(), required);
             changed = true;
         }
         if parameters.get("additionalProperties") != Some(&Value::Bool(false)) {
@@ -593,6 +587,16 @@ mod tests {
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert!(body.get("top_logprobs").is_none());
         assert_eq!(body["tool_choice"], "auto");
+        let tool_search = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["type"] == "tool_search")
+            .unwrap();
+        assert_eq!(
+            tool_search["parameters"]["required"],
+            json!(["query", "limit", "filters"])
+        );
         assert!(body["tools"].as_array().unwrap().iter().all(|tool| {
             tool.get("name").and_then(Value::as_str) != Some("from_input")
                 || tool.get("parameters").is_some()
@@ -666,10 +670,11 @@ mod tests {
             },
             "tool_choice": "auto"
         });
-        let before = body.clone();
-
-        assert!(!apply_opencode_muse_request_compat(&mut body));
-        assert_eq!(body, before);
+        assert!(apply_opencode_muse_request_compat(&mut body));
+        assert_eq!(
+            body["tools"][1]["parameters"]["required"],
+            json!(["query", "limit", "filters"])
+        );
         assert!(body["tools"][0].get("tools").is_some());
     }
 

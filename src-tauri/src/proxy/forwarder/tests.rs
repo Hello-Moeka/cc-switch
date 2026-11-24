@@ -2129,6 +2129,10 @@ fn native_responses_opencode_muse_preserves_accepted_shapes_and_pairs_receipts()
         body["tools"][1]["parameters"]["properties"]["limit"]["type"],
         "number"
     );
+    assert_eq!(
+        body["tools"][1]["parameters"]["required"],
+        json!(["query", "limit"])
+    );
     assert_eq!(body["input"][0]["type"], "tool_search_output");
     assert_eq!(body["input"][1]["arguments"], "{}");
     assert_eq!(body["input"][2]["type"], "function_call_output");
