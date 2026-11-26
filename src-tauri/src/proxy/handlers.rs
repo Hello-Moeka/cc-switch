@@ -1338,19 +1338,25 @@ async fn handle_responses_for_app(
             .await;
     }
 
-    // Native Responses passthrough to a strict gateway (xAI): restore flattened
-    // function-call names *and* rewrite whole-float tool arguments. The integer
-    // rewrite must run even when the request had no namespace tools.
-    if super::providers::provider_needs_responses_namespace_flatten(
+    // Native Responses passthrough that can expose flattened namespace names
+    // needs response-side restoration. xAI additionally rewrites whole-float
+    // tool arguments; Muse keeps its argument payload unchanged.
+    let xai_native_rewrite = super::providers::provider_needs_responses_namespace_flatten(
         &ctx.provider,
         ctx.outbound_model.as_deref(),
-    ) {
-        return handle_codex_xai_native_responses_rewrite(
+    );
+    let muse_native_rewrite = super::providers::provider_needs_opencode_muse_native_compat(
+        &ctx.provider,
+        ctx.outbound_model.as_deref(),
+    );
+    if xai_native_rewrite || muse_native_rewrite {
+        return handle_codex_native_responses_rewrite(
             response,
             &ctx,
             &state,
             connection_guard,
             namespace_restore_map,
+            xai_native_rewrite,
         )
         .await;
     }
@@ -1628,11 +1634,12 @@ async fn handle_codex_late_arguments_repair(
         })
 }
 
-/// Response handler for native Responses to xAI (direct or Copilot): restore
-/// flattened `function_call` names and rewrite whole-float tool arguments.
-/// Error bodies pass through unchanged. Usage is collected exactly as
-/// `process_response` would (same `CODEX_PARSER_CONFIG`).
-async fn handle_codex_xai_native_responses_rewrite(
+/// Response handler for native Responses upstreams that expose flattened
+/// namespace names. It always restores `{name, namespace}`; xAI additionally
+/// rewrites whole-float tool arguments. Error bodies pass through unchanged.
+/// Usage is collected exactly as `process_response` would (same
+/// `CODEX_PARSER_CONFIG`).
+async fn handle_codex_native_responses_rewrite(
     response: super::hyper_client::ProxyResponse,
     ctx: &RequestContext,
     state: &ProxyState,
@@ -1641,6 +1648,7 @@ async fn handle_codex_xai_native_responses_rewrite(
         String,
         transform_codex_responses_namespace::NamespacedName,
     >,
+    normalize_integer_arguments: bool,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
 
@@ -1664,12 +1672,14 @@ async fn handle_codex_xai_native_responses_rewrite(
     if response.is_sse() {
         let builder = rewritten_sse_response_builder(status, response.headers());
 
-        // Copilot: stabilize item IDs, then repair late tool arguments, then restore
-        // Grok names. Direct xAI responses retain their original stream pipeline.
+        // Copilot needs stable item IDs. Copilot and Muse both need the shared
+        // late-argument repair before their namespaces are rewritten.
         let stream = codex_native_responses_stream(response, ctx);
+        let repair_late_arguments =
+            !normalize_integer_arguments || ctx.provider.is_github_copilot();
         let stream: std::pin::Pin<
             Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
-        > = if matches!(ctx.app_type, AppType::Codex) && ctx.provider.is_github_copilot() {
+        > = if repair_late_arguments {
             Box::pin(
                 super::providers::responses_late_arguments::create_late_arguments_repair_stream(
                     stream,
@@ -1679,9 +1689,10 @@ async fn handle_codex_xai_native_responses_rewrite(
             stream
         };
         let restore_stream =
-            transform_codex_responses_xai_sanitize::create_xai_native_responses_sse_stream(
+            transform_codex_responses_xai_sanitize::create_native_responses_rewrite_sse_stream(
                 stream,
                 restore_map,
+                normalize_integer_arguments,
             );
         let usage_collector =
             create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
@@ -1728,9 +1739,10 @@ async fn handle_codex_xai_native_responses_rewrite(
                 &mut value,
                 &restore_map,
             );
-            transform_codex_responses_xai_sanitize::normalize_xai_function_call_integer_arguments(
-                &mut value,
-            );
+            if normalize_integer_arguments {
+                transform_codex_responses_xai_sanitize::
+                    normalize_xai_function_call_integer_arguments(&mut value);
+            }
             if let Some(usage) =
                 TokenUsage::from_codex_response_auto(&value).filter(TokenUsage::has_billable_tokens)
             {
@@ -5421,6 +5433,99 @@ mod copilot_grok_responses_tests {
     }
 
     #[tokio::test]
+    async fn muse_rewrite_restores_dynamically_loaded_namespace_calls() {
+        let (state, mut ctx) = context(false).await;
+        ctx.provider.settings_config = json!({
+            "config": "model_provider = \"custom\"\nmodel = \"muse-spark-1.3-contributor\"\n\n[model_providers.custom]\nbase_url = \"https://opencode.ai/zen/go/v1\"\nwire_api = \"responses\"\n"
+        });
+        ctx.outbound_model = Some("muse-spark-1.3-contributor".to_string());
+        assert!(
+            super::super::providers::provider_needs_opencode_muse_native_compat(
+                &ctx.provider,
+                ctx.outbound_model.as_deref(),
+            )
+        );
+
+        let restore_map = transform_codex_responses_namespace::namespace_restore_map(&json!({
+            "tools": [{ "type": "tool_search" }],
+            "input": [{
+                "type": "tool_search_output",
+                "call_id": "call_search",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "mcp__codex_app",
+                    "tools": [{
+                        "type": "function",
+                        "name": "read_thread",
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "threadId": { "type": "string" } },
+                            "required": ["threadId"]
+                        }
+                    }]
+                }]
+            }]
+        }));
+        let call = json!({
+            "type": "function_call",
+            "id": "fc_read",
+            "call_id": "call_read",
+            "name": "mcp__codex_app__read_thread",
+            "arguments": "{\"threadId\":\"01a201a8-a429-7f41-b1a7-808b42696853\"}"
+        });
+        let input: String = [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": call
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": call
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_muse",
+                    "status": "completed",
+                    "model": "muse-spark-1.3-contributor",
+                    "output": [call]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect();
+
+        let response = handle_codex_native_responses_rewrite(
+            upstream(&input),
+            &ctx,
+            &state,
+            None,
+            restore_map,
+            false,
+        )
+        .await
+        .unwrap();
+        let (_, events) = body_and_events(response).await;
+
+        assert_eq!(events.len(), 3);
+        for item in [
+            &events[0]["item"],
+            &events[1]["item"],
+            &events[2]["response"]["output"][0],
+        ] {
+            assert_eq!(item["name"], "read_thread");
+            assert_eq!(item["namespace"], "mcp__codex_app");
+            assert_eq!(
+                item["arguments"],
+                "{\"threadId\":\"01a201a8-a429-7f41-b1a7-808b42696853\"}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn copilot_grok_rewrite_restores_late_tool_arguments() {
         let (state, mut ctx) = context(true).await;
         // The client-facing route can have a different name from the resolved model.
@@ -5456,12 +5561,13 @@ mod copilot_grok_responses_tests {
         .into_iter()
         .map(|event| format!("data: {event}\n\n"))
         .collect();
-        let response = handle_codex_xai_native_responses_rewrite(
+        let response = handle_codex_native_responses_rewrite(
             upstream(&input),
             &ctx,
             &state,
             None,
             restore_map,
+            true,
         )
         .await
         .unwrap();
@@ -5514,12 +5620,13 @@ mod copilot_grok_responses_tests {
         .into_iter()
         .map(|event| format!("data: {event}\n\n"))
         .collect();
-        let response = handle_codex_xai_native_responses_rewrite(
+        let response = handle_codex_native_responses_rewrite(
             upstream(&input),
             &ctx,
             &state,
             None,
             grok_namespace_restore_map(),
+            true,
         )
         .await
         .unwrap();
@@ -5565,12 +5672,13 @@ mod copilot_grok_responses_tests {
         headers.insert("content-type", "application/json".parse().unwrap());
         headers.insert("content-length", input.to_string().len().into());
         headers.insert("x-request-id", "upstream-request".parse().unwrap());
-        let response = handle_codex_xai_native_responses_rewrite(
+        let response = handle_codex_native_responses_rewrite(
             ProxyResponse::buffered(StatusCode::OK, headers, Bytes::from(input.to_string())),
             &ctx,
             &state,
             None,
             grok_namespace_restore_map(),
+            true,
         )
         .await
         .unwrap();
@@ -5590,7 +5698,7 @@ mod copilot_grok_responses_tests {
     async fn copilot_grok_rewrite_passes_error_bodies_through() {
         let (state, ctx) = context(true).await;
         let input = Bytes::from_static(br#"{"error":{"message":"upstream rejected request"}}"#);
-        let response = handle_codex_xai_native_responses_rewrite(
+        let response = handle_codex_native_responses_rewrite(
             ProxyResponse::buffered(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 axum::http::HeaderMap::new(),
@@ -5600,6 +5708,7 @@ mod copilot_grok_responses_tests {
             &state,
             None,
             grok_namespace_restore_map(),
+            true,
         )
         .await
         .unwrap();

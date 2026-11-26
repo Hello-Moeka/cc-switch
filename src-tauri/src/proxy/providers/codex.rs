@@ -237,6 +237,58 @@ pub fn provider_needs_responses_namespace_flatten(
             }))
 }
 
+/// OpenCode's native Responses validator still needs a small compatibility
+/// pass for Muse, while its accepted Codex extensions (`namespace`,
+/// `tool_search`, `tool_search_output`) must remain intact.
+pub fn provider_needs_opencode_muse_native_compat(
+    provider: &Provider,
+    outbound_model: Option<&str>,
+) -> bool {
+    if !outbound_model.is_some_and(crate::codex_config::is_codex_muse_spark_model) {
+        return false;
+    }
+
+    let config_text = provider
+        .settings_config
+        .get("config")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    let api_format = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.api_format.as_deref())
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("api_format")
+                .and_then(JsonValue::as_str)
+        })
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("apiFormat")
+                .and_then(JsonValue::as_str)
+        });
+    let native_responses = extract_codex_wire_api_from_toml(config_text)
+        .is_some_and(|wire_api| wire_api.eq_ignore_ascii_case("responses"))
+        || api_format.is_some_and(|format| format.eq_ignore_ascii_case("openai_responses"));
+    if !native_responses {
+        return false;
+    }
+
+    let base_url = extract_codex_base_url(config_text).or_else(|| {
+        provider
+            .settings_config
+            .get("base_url")
+            .or_else(|| provider.settings_config.get("baseURL"))
+            .or_else(|| provider.settings_config.get("baseUrl"))
+            .and_then(JsonValue::as_str)
+            .map(ToString::to_string)
+    });
+    base_url
+        .is_some_and(|url| crate::codex_config::codex_url_host_matches_any(&url, &["opencode.ai"]))
+}
+
 /// True when this Codex provider talks native Responses to first-party xAI
 /// (`api.x.ai`), including API-key Grok cards that are not `xai_oauth`.
 fn provider_is_xai_native_responses(provider: &Provider) -> bool {

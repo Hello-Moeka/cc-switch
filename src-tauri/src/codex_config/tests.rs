@@ -3401,6 +3401,69 @@ fn proxy_chat_catalog_ignores_codex_models_cache() {
 }
 
 #[test]
+fn muse_spark_opencode_catalog_uses_direct_tools_without_freeform_edits() {
+    let settings = json!({
+        "modelCatalog": {
+            "models": [
+                { "model": "ccs-opencode-4/muse-spark-1.3-contributor" },
+                { "model": "deepseek-v4.1-flash" }
+            ]
+        }
+    });
+    let config = r#"
+model_provider = "custom"
+model = "muse-spark-1.3-contributor"
+
+[model_providers.custom]
+base_url = "https://opencode.ai/zen/go/v1"
+wire_api = "responses"
+"#;
+    let catalog = codex_model_catalog_from_settings(
+        &settings,
+        config,
+        CodexCatalogToolProfile::NativeResponses,
+    )
+    .unwrap()
+    .unwrap();
+    let muse = &catalog["models"][0];
+
+    assert_eq!(muse["tool_mode"], "direct");
+    assert_eq!(muse["supports_search_tool"], true);
+    assert_eq!(muse["supports_parallel_tool_calls"], true);
+    assert_eq!(muse["shell_type"], "shell_command");
+    assert_eq!(muse["comp_hash"], CODEX_MUSE_SPARK_DIRECT_COMP_HASH);
+    assert!(muse.get("apply_patch_tool_type").is_none());
+    assert!(muse.get("web_search_tool_type").is_none());
+    assert!(catalog["models"][1].get("tool_mode").is_none());
+
+    let relay_config = config.replace("https://opencode.ai/zen/go/v1", "https://relay.example/v1");
+    let relay_catalog = codex_model_catalog_from_settings(
+        &settings,
+        &relay_config,
+        CodexCatalogToolProfile::NativeResponses,
+    )
+    .unwrap()
+    .unwrap();
+    let relay_muse = &relay_catalog["models"][0];
+    assert!(relay_muse.get("tool_mode").is_none());
+    assert_ne!(relay_muse["supports_search_tool"], true);
+    assert_ne!(relay_muse["comp_hash"], CODEX_MUSE_SPARK_DIRECT_COMP_HASH);
+
+    let stacked = plan_codex_stack_catalog(
+        CodexStackRoute::ThirdParty(CodexCatalogRow {
+            settings: &settings,
+            config_text: config,
+            profile: CodexCatalogToolProfile::NativeResponses,
+        }),
+        &[],
+        false,
+    )
+    .unwrap();
+    assert_eq!(stacked["models"][0]["tool_mode"], "direct");
+    assert_eq!(stacked["models"][0]["comp_hash"], CODEX_STACK_COMP_HASH);
+}
+
+#[test]
 fn static_template_has_required_keys() {
     let template = load_codex_classic_tool_template();
     for key in &[

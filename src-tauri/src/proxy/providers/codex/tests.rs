@@ -1492,6 +1492,93 @@ fn copilot_namespace_compat_uses_only_the_outbound_grok_model() {
 }
 
 #[test]
+fn opencode_muse_gate_requires_muse_model_and_native_responses() {
+    let provider = |config: &str| {
+        create_provider(json!({
+            "auth": { "OPENAI_API_KEY": "sk-opencode" },
+            "config": config
+        }))
+    };
+    let opencode = provider(
+        r#"
+model_provider = "custom"
+model = "muse-spark-1.3-contributor"
+
+[model_providers.custom]
+base_url = "https://opencode.ai/zen/go/v1"
+wire_api = "responses"
+"#,
+    );
+    for model in [
+        Some("muse-spark-1.3-contributor"),
+        Some("ccs-opencode-4/muse-spark-1.3-contributor"),
+        Some(" MUSE-SPARK-2 "),
+    ] {
+        assert!(
+            provider_needs_opencode_muse_native_compat(&opencode, model),
+            "{model:?}"
+        );
+    }
+    for model in [
+        Some("deepseek-v4.1-flash"),
+        Some("ccs-opencode-4/deepseek-v4.1-flash"),
+        Some("muse-other"),
+        Some(""),
+        None,
+    ] {
+        assert!(
+            !provider_needs_opencode_muse_native_compat(&opencode, model),
+            "{model:?}"
+        );
+    }
+
+    let relay = provider(
+        r#"
+model_provider = "custom"
+model = "muse-spark-1.3-contributor"
+
+[model_providers.custom]
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+"#,
+    );
+    assert!(!provider_needs_opencode_muse_native_compat(
+        &relay,
+        Some("muse-spark-1.3-contributor")
+    ));
+
+    let chat = provider(
+        r#"
+model_provider = "custom"
+model = "muse-spark-1.3-contributor"
+
+[model_providers.custom]
+base_url = "https://opencode.ai/zen/go/v1"
+wire_api = "chat"
+"#,
+    );
+    assert!(!provider_needs_opencode_muse_native_compat(
+        &chat,
+        Some("muse-spark-1.3-contributor")
+    ));
+
+    let mut api_format = create_provider(json!({
+        "auth": { "OPENAI_API_KEY": "sk-opencode" },
+        "base_url": "https://opencode.ai/zen/go/v1",
+        "api_format": "openai_responses"
+    }));
+    api_format.settings_config = json!({
+        "auth": { "OPENAI_API_KEY": "sk-opencode" },
+        "base_url": "https://opencode.ai/zen/go/v1",
+        "api_format": "openai_responses"
+    });
+    assert!(provider_needs_opencode_muse_native_compat(
+        &api_format,
+        Some("muse-spark-1.3-contributor")
+    ));
+}
+
+#[test]
 fn strip_private_include_markers_leaves_everything_else() {
     for (case, include, stripped, expected) in [
         (

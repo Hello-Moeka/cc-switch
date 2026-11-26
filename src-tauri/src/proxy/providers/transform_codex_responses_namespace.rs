@@ -46,9 +46,31 @@ pub(crate) struct NamespacedName {
 /// flatten; derives names exactly as [`flatten_request_namespaces`] does.
 pub(crate) fn namespace_restore_map(request_body: &Value) -> HashMap<String, NamespacedName> {
     let mut map = HashMap::new();
-    let Some(tools) = request_body.get("tools").and_then(Value::as_array) else {
-        return map;
-    };
+
+    if let Some(tools) = request_body.get("tools").and_then(Value::as_array) {
+        collect_namespace_restore_entries(tools, &mut map);
+    }
+    if let Some(tools) = request_body
+        .get("additional_tools")
+        .and_then(Value::as_array)
+    {
+        collect_namespace_restore_entries(tools, &mut map);
+    }
+    if let Some(input) = request_body.get("input").and_then(Value::as_array) {
+        for item in input {
+            let item_type = item.get("type").and_then(Value::as_str);
+            if !matches!(item_type, Some("tool_search_output" | "additional_tools")) {
+                continue;
+            }
+            if let Some(tools) = item.get("tools").and_then(Value::as_array) {
+                collect_namespace_restore_entries(tools, &mut map);
+            }
+        }
+    }
+    map
+}
+
+fn collect_namespace_restore_entries(tools: &[Value], map: &mut HashMap<String, NamespacedName>) {
     for tool in tools {
         if tool.get("type").and_then(Value::as_str) != Some("namespace") {
             continue;
@@ -72,13 +94,15 @@ pub(crate) fn namespace_restore_map(request_body: &Value) -> HashMap<String, Nam
                 continue;
             }
             let flat = flatten_namespace_tool_name(namespace, name);
-            map.entry(flat).or_insert_with(|| NamespacedName {
+            let entry = NamespacedName {
                 namespace: namespace.to_string(),
                 name: name.to_string(),
-            });
+            };
+            map.entry(flat).or_insert_with(|| entry.clone());
+            let dotted = format!("{}.{}", namespace.trim_end_matches(['_', '.']), name);
+            map.entry(dotted).or_insert(entry);
         }
     }
-    map
 }
 
 /// Flatten Codex `namespace` tool declarations in a native Responses request
@@ -429,6 +453,84 @@ mod tests {
         assert_eq!(entry.name, "read");
         // Plain top-level tools are not in the restore map.
         assert!(!map.contains_key("plain_tool"));
+    }
+
+    #[test]
+    fn restore_map_reads_dynamically_loaded_tool_search_namespaces() {
+        let body = json!({
+            "tools": [{ "type": "tool_search" }],
+            "input": [{
+                "type": "tool_search_output",
+                "call_id": "call_search",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "mcp__codex_app",
+                    "tools": [{
+                        "type": "function",
+                        "name": "read_thread",
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "threadId": { "type": "string" } },
+                            "required": ["threadId"]
+                        }
+                    }]
+                }]
+            }]
+        });
+        let map = namespace_restore_map(&body);
+        let entry = map.get("mcp__codex_app__read_thread").unwrap();
+        assert_eq!(entry.namespace, "mcp__codex_app");
+        assert_eq!(entry.name, "read_thread");
+        let dotted = map.get("mcp__codex_app.read_thread").unwrap();
+        assert_eq!(dotted.namespace, "mcp__codex_app");
+        assert_eq!(dotted.name, "read_thread");
+    }
+
+    #[test]
+    fn restores_both_flat_alias_styles_from_dynamic_tools() {
+        let body = json!({
+            "tools": [{ "type": "tool_search" }],
+            "input": [{
+                "type": "tool_search_output",
+                "call_id": "call_search",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "mcp__codex_app",
+                    "tools": [{
+                        "type": "function",
+                        "name": "read_thread",
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "threadId": { "type": "string" } },
+                            "required": ["threadId"]
+                        }
+                    }]
+                }]
+            }]
+        });
+        let map = namespace_restore_map(&body);
+        let mut response = json!({
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_double_underscore",
+                    "name": "mcp__codex_app__read_thread",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_dot",
+                    "name": "mcp__codex_app.read_thread",
+                    "arguments": "{}"
+                }
+            ]
+        });
+
+        assert!(restore_response_namespaces(&mut response, &map));
+        for call in response["output"].as_array().unwrap() {
+            assert_eq!(call["name"], "read_thread");
+            assert_eq!(call["namespace"], "mcp__codex_app");
+        }
     }
 
     #[test]

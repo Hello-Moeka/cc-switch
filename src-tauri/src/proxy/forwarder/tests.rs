@@ -2382,6 +2382,90 @@ fn native_responses_rewrites_call_id_less_outputs_for_non_xai_providers() {
 }
 
 #[test]
+fn native_responses_opencode_muse_preserves_accepted_shapes_and_pairs_receipts() {
+    let mut provider = test_provider_with_type(None);
+    provider.settings_config = json!({
+        "config": "model_provider = \"custom\"\nmodel = \"muse-spark-1.3-contributor\"\n\n[model_providers.custom]\nbase_url = \"https://opencode.ai/zen/go/v1\"\nwire_api = \"responses\"\n"
+    });
+    let mut body = json!({
+        "model": "ccs-opencode-4/muse-spark-1.3-contributor",
+        "access_programs": ["codex"],
+        "external_web_access": true,
+        "include": [
+            "reasoning.encrypted_content",
+            "message.output_text.logprobs"
+        ],
+        "top_logprobs": 1,
+        "reasoning": { "effort": "minimal", "summary": "none" },
+        "tools": [{
+            "type": "namespace",
+            "name": "mcp__probe",
+            "tools": [{
+                "type": "function",
+                "name": "echo"
+            }]
+        }, {
+            "type": "tool_search",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "number" }
+                },
+                "required": ["query"]
+            }
+        }],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "answer",
+                "schema": { "type": "object" }
+            }
+        },
+        "tool_choice": "required",
+        "input": [{
+            "type": "tool_search_output",
+            "tools": [{
+                "type": "function",
+                "name": "already_accepted",
+                "parameters": { "type": "object", "properties": {} }
+            }]
+        }, {
+            "type": "function_call",
+            "call_id": "call_only",
+            "name": "echo",
+            "arguments": ""
+        }, {
+            "type": "function_call_output",
+            "output": "ok"
+        }]
+    });
+
+    apply_native_responses_request_compat(&provider, &mut body, false).unwrap();
+
+    assert!(body.get("access_programs").is_none());
+    assert!(body.get("external_web_access").is_none());
+    assert!(body.get("top_logprobs").is_none());
+    assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    assert_eq!(body["reasoning"], json!({ "effort": "minimal" }));
+    assert_eq!(body["tool_choice"], "auto");
+    assert_eq!(body["tools"][0]["type"], "namespace");
+    assert_eq!(body["tools"][1]["type"], "tool_search");
+    assert_eq!(
+        body["tools"][1]["parameters"]["properties"]["limit"]["type"],
+        "number"
+    );
+    assert_eq!(
+        body["tools"][1]["parameters"]["required"],
+        json!(["query", "limit"])
+    );
+    assert_eq!(body["input"][0]["type"], "tool_search_output");
+    assert_eq!(body["input"][1]["arguments"], "{}");
+    assert_eq!(body["input"][2]["type"], "function_call_output");
+    assert_eq!(body["input"][2]["call_id"], "call_only");
+}
+
+#[test]
 fn native_responses_keeps_official_call_id_less_outputs() {
     let mut provider = test_provider_with_type(None);
     provider.category = Some("official".to_string());
